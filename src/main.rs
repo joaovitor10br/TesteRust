@@ -1,200 +1,114 @@
-use clap::Parser;
-use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::io::{self};
-use std::env;
-use std::ffi::OsStr;
-use std::time::Duration;
-use std::thread::sleep;
-use scopeguard::guard;
-
-/// Macro simples para logs padronizados
-macro_rules! log {
-    ($($arg:tt)*) => {
-        eprintln!("[iso_injector] {}", format!($($arg)*));
-    }
-}
-
-/// Executa um comando no sistema, exibindo saída em tempo real e falhando em erro.
-fn run_cmd<S: AsRef<OsStr> + std::fmt::Debug>(cmd: &str, args: &[S]) -> io::Result<()> {
-    eprintln!("> {} {}", cmd, args.iter().map(|a| a.as_ref().to_string_lossy()).collect::<Vec<_>>().join(" "));
-    let mut c = Command::new(cmd);
-    c.args(args);
-    c.stdin(Stdio::inherit());
-    c.stdout(Stdio::inherit());
-    c.stderr(Stdio::inherit());
-    let status = c.status()?;
-    if !status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, format!("Command failed: {} {:?}", cmd, args)));
-    }
-    Ok(())
-}
-
-#[derive(Parser, Debug)]
-#[command(author, version, about = "Desmonta ISO, injeta pacotes via script e remonta (caso squashfs).")]
-struct Args {
-    /// Caminho para a ISO de entrada
-    #[arg(long)]
-    iso: PathBuf,
-
-    /// Caminho para a ISO de saída
-    #[arg(long)]
-    out: PathBuf,
-
-    /// Script executado dentro do chroot para instalar pacotes (opcional)
-    #[arg(long)]
-    install_script: Option<PathBuf>,
-
-    /// Use xorriso em vez de genisoimage (padrão: true)
-    #[arg(long, default_value_t = true)]
-    use_xorriso: bool,
-}
-
-/// Verifica se está sendo executado como root
-fn is_root() -> bool {
-    match Command::new("id").arg("-u").output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == "0",
-        Err(_) => false,
-    }
-}
+use tempfile::tempdir;
+use std::process::Command;
+use std::fs;
+use std::io;
 
 fn main() -> io::Result<()> {
-    let a = Args::parse();
+    // === Caminhos de exemplo (mude conforme necessário) ===
+    let iso_path = PathBuf::from("/home/joao/Downloads/linuxmint-22.2-cinnamon-64bit.iso");
+    let output_iso = PathBuf::from("/home/joao/mint-firefox.iso");
+    let inject_file = PathBuf::from("/home/joao/Downloads/firefox-144.0.2.tar.xz");
+    let inject_dest = PathBuf::from("/opt/firefox");
 
-    if !is_root() {
-        eprintln!("❌ Este programa precisa ser executado como root. Abortando.");
+    // === Cria diretório temporário ===
+    let tmpdir = tempdir()?;
+    let tmp_path = tmpdir.path().to_path_buf();
+
+    let mount_dir = tmp_path.join("iso_mount");
+    let work_dir = tmp_path.join("work");
+
+    fs::create_dir_all(&mount_dir)?;
+    fs::create_dir_all(&work_dir)?;
+
+    println!("> mount -o loop,ro {} {}", iso_path.display(), mount_dir.display());
+
+    // === Monta a ISO ===
+    let status = Command::new("mount")
+        .args(["-o", "loop,ro", iso_path.to_str().unwrap(), mount_dir.to_str().unwrap()])
+        .status()?;
+
+    if !status.success() {
+        eprintln!("❌ Falha ao montar a ISO (tente rodar como root)");
         std::process::exit(1);
     }
 
-    let iso = a.iso.canonicalize()?;
-    if !iso.exists() {
-        eprintln!("❌ ISO de entrada não existe: {:?}", iso);
+    // === Copia conteúdo da ISO ===
+    println!("> rsync -aH {} {}", mount_dir.display(), work_dir.display());
+    let status = Command::new("rsync")
+        .args(["-aH", &format!("{}/", mount_dir.display()), work_dir.to_str().unwrap()])
+        .status()?;
+
+    if !status.success() {
+        eprintln!("❌ Falha ao copiar conteúdo da ISO");
         std::process::exit(1);
     }
 
-    // Diretórios temporários
-    let base = env::temp_dir().join(format!("iso_injector_{}", chrono::Utc::now().timestamp()));
-    let mount_iso = base.join("iso_mount");
-    let work = base.join("work");
-    let squash_root = base.join("squashfs-root");
-    fs::create_dir_all(&mount_iso)?;
-    fs::create_dir_all(&work)?;
-    fs::create_dir_all(&squash_root)?;
+    // === Procura boot loaders ===
+    let mut isolinux_path = None;
+    let mut grub_efi_path = None;
 
-    // Guard de limpeza automática (executa no final ou em erro)
-    let _cleanup = guard(base.clone(), |b| {
-        let _ = Command::new("umount").arg(mount_iso.as_os_str()).status();
-        let _ = fs::remove_dir_all(&b);
-    });
+    for entry in walkdir::WalkDir::new(&work_dir) {
+        let entry = entry?;
+        let path = entry.path();
 
-    // Montar a ISO
-    run_cmd("mount", &[
-        OsStr::new("-o"), OsStr::new("loop,ro"),
-        iso.as_os_str(),
-        mount_iso.as_os_str()
-    ])?;
-
-    // Copiar conteúdo
-    run_cmd("rsync", &[OsStr::new("-aH"), mount_iso.as_os_str(), work.as_os_str()])?;
-
-    // Verificar squashfs
-    let possible_squash = work.join("casper").join("filesystem.squashfs");
-    if possible_squash.exists() {
-        log!("Encontrado squashfs em {:?}", possible_squash);
-
-        // Extrair squashfs
-        run_cmd("unsquashfs", &[OsStr::new("-d"), squash_root.as_os_str(), possible_squash.as_os_str()])?;
-
-        // Bind mounts e DNS
-        run_cmd("mount", &[OsStr::new("--bind"), OsStr::new("/dev"), squash_root.join("dev").as_os_str()])?;
-        run_cmd("mount", &[OsStr::new("--bind"), OsStr::new("/proc"), squash_root.join("proc").as_os_str()])?;
-        run_cmd("mount", &[OsStr::new("--bind"), OsStr::new("/sys"), squash_root.join("sys").as_os_str()])?;
-        fs::create_dir_all(squash_root.join("etc"))?;
-        run_cmd("bash", &[OsStr::new("-c"), OsStr::new(&format!("cp -L /etc/resolv.conf {}/etc/resolv.conf", squash_root.display()))])?;
-
-        // Executar script dentro do chroot
-        if let Some(script) = &a.install_script {
-            let target = squash_root.join("tmp").join("install_in_chroot.sh");
-            fs::create_dir_all(target.parent().unwrap())?;
-            fs::copy(script, &target)?;
-            run_cmd("chmod", &[OsStr::new("+x"), target.as_os_str()])?;
-            log!("Executando script dentro do chroot...");
-            run_cmd("chroot", &[squash_root.as_os_str(), OsStr::new("/bin/bash"), OsStr::new("-c"), OsStr::new("/tmp/install_in_chroot.sh")])?;
-        } else {
-            log!("Nenhum script de instalação fornecido — você pode abrir o chroot manualmente se quiser.");
-            eprintln!("chroot {} /bin/bash", squash_root.display());
-        }
-
-        // Sincronizar e reconstruir
-        run_cmd::<&str>("sync", &[] as &[&str])?;
-        fs::remove_file(&possible_squash).ok();
-        log!("Recriando squashfs...");
-        run_cmd("mksquashfs", &[squash_root.as_os_str(), possible_squash.as_os_str(), OsStr::new("-noappend")])?;
-
-        // Desmontar binds
-        run_cmd("umount", &[squash_root.join("dev").as_os_str()])?;
-        run_cmd("umount", &[squash_root.join("proc").as_os_str()])?;
-        run_cmd("umount", &[squash_root.join("sys").as_os_str()])?;
-    } else {
-        log!("Nenhum squashfs detectado, tentando injeção direta.");
-        if let Some(script) = &a.install_script {
-            let maybe_root = work.join("rootfs");
-            if maybe_root.exists() {
-                run_cmd("mount", &[OsStr::new("--bind"), OsStr::new("/dev"), maybe_root.join("dev").as_os_str()])?;
-                run_cmd("mount", &[OsStr::new("--bind"), OsStr::new("/proc"), maybe_root.join("proc").as_os_str()])?;
-                run_cmd("mount", &[OsStr::new("--bind"), OsStr::new("/sys"), maybe_root.join("sys").as_os_str()])?;
-                let target = maybe_root.join("tmp").join("install_in_chroot.sh");
-                fs::create_dir_all(target.parent().unwrap())?;
-                fs::copy(script, &target)?;
-                run_cmd("chmod", &[OsStr::new("+x"), target.as_os_str()])?;
-                run_cmd("chroot", &[maybe_root.as_os_str(), OsStr::new("/bin/bash"), OsStr::new("-c"), OsStr::new("/tmp/install_in_chroot.sh")])?;
-                run_cmd("umount", &[maybe_root.join("dev").as_os_str()])?;
-                run_cmd("umount", &[maybe_root.join("proc").as_os_str()])?;
-                run_cmd("umount", &[maybe_root.join("sys").as_os_str()])?;
-            } else {
-                log!("Não encontrei um rootfs, inspecione manualmente '{}'", work.display());
-            }
-        } else {
-            log!("Nada a injetar automaticamente.");
+        if path.ends_with("isolinux.bin") {
+            isolinux_path = Some(path.to_path_buf());
+        } else if path.ends_with("efi.img") {
+            grub_efi_path = Some(path.to_path_buf());
         }
     }
 
-    // Atualizar md5sum.txt se existir
-    let md5sum_file = work.join("md5sum.txt");
-    if md5sum_file.exists() {
-        log!("Atualizando md5sum.txt...");
-        run_cmd("bash", &[
-            OsStr::new("-c"),
-            OsStr::new(&format!(
-                "cd {} && find . -type f ! -path './md5sum.txt' -print0 | xargs -0 md5sum > md5sum.txt",
-                work.display()
-            )),
-        ])?;
+    if isolinux_path.is_none() && grub_efi_path.is_none() {
+        eprintln!("❌ Nenhum arquivo de boot encontrado (isolinux ou grub)");
+        let _ = Command::new("umount").arg(&mount_dir).status();
+        return Ok(());
     }
 
-    // Criar nova ISO
-    log!("Criando nova ISO em {:?}", a.out);
-    if a.use_xorriso {
-        run_cmd("xorriso", &[
-            OsStr::new("-as"), OsStr::new("mkisofs"),
-            OsStr::new("-o"), a.out.as_os_str(),
-            OsStr::new("-J"), OsStr::new("-r"),
-            work.as_os_str()
-        ])?;
-    } else {
-        run_cmd("genisoimage", &[
-            OsStr::new("-o"), a.out.as_os_str(),
-            OsStr::new("-J"), OsStr::new("-r"),
-            work.as_os_str()
-        ])?;
+    println!(
+        "[iso_injector] Detectado boot loader: isolinux: {:?}, grub EFI: {:?}",
+        isolinux_path, grub_efi_path
+    );
+
+    // === Injeta o arquivo ===
+    let dest_path = work_dir.join(inject_dest.strip_prefix("/").unwrap());
+    fs::create_dir_all(&dest_path)?;
+    fs::copy(&inject_file, dest_path.join(inject_file.file_name().unwrap()))?;
+    println!("> Arquivo injetado em {}", dest_path.display());
+
+    // === Gera nova ISO ===
+    println!("> xorriso -as mkisofs -o {} -J -r {}", output_iso.display(), work_dir.display());
+
+    let status = Command::new("xorriso")
+        .args([
+            "-as", "mkisofs",
+            "-o", output_iso.to_str().unwrap(),
+            "-J",
+            "-r",
+            "-V", "LINUX_MINT_CUSTOM",
+            "-isohybrid-mbr", "/usr/lib/syslinux/bios/isohdpfx.bin",
+            "-c", "boot.cat",
+            "-b", "isolinux/isolinux.bin",
+            "-no-emul-boot",
+            "-boot-load-size", "4",
+            "-boot-info-table",
+            "-eltorito-alt-boot",
+            "-e", "boot/grub/efi.img",
+            "-no-emul-boot",
+            work_dir.to_str().unwrap(),
+        ])
+        .status()?;
+
+    if !status.success() {
+        eprintln!("❌ Falha ao gerar nova ISO");
+        std::process::exit(1);
     }
 
-    // Desmontar e limpar
-    run_cmd("umount", &[mount_iso.as_os_str()])?;
-    sleep(Duration::from_millis(200));
-    fs::remove_dir_all(&base).ok();
+    // === Desmonta ISO ===
+    println!("> umount {}", mount_dir.display());
+    let _ = Command::new("umount").arg(&mount_dir).status();
 
-    log!("Feito! Nova ISO: {:?}", a.out);
+    println!("✅ ISO modificada criada com sucesso!");
+    println!("📦 Arquivo final: {}", output_iso.display());
     Ok(())
 }
