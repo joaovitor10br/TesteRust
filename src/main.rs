@@ -23,13 +23,12 @@ fn main() -> io::Result<()> {
 
     println!("> mount -o loop,ro {} {}", iso_path.display(), mount_dir.display());
 
-    // === Monta a ISO ===
+    // === Monta ISO ===
     let status = Command::new("mount")
         .args(["-o", "loop,ro", iso_path.to_str().unwrap(), mount_dir.to_str().unwrap()])
         .status()?;
-
     if !status.success() {
-        eprintln!("❌ Falha ao montar a ISO (tente rodar como root)");
+        eprintln!("❌ Falha ao montar ISO");
         std::process::exit(1);
     }
 
@@ -38,75 +37,76 @@ fn main() -> io::Result<()> {
     let status = Command::new("rsync")
         .args(["-aH", &format!("{}/", mount_dir.display()), work_dir.to_str().unwrap()])
         .status()?;
-
     if !status.success() {
-        eprintln!("❌ Falha ao copiar conteúdo da ISO");
+        eprintln!("❌ Erro ao copiar conteúdo da ISO");
         std::process::exit(1);
     }
 
-    // === Procura boot loaders ===
-    let mut isolinux_path = None;
-    let mut grub_efi_path = None;
+    // === Procura arquivos de boot EFI modernamente ===
+    let mut efi_boot: Option<PathBuf> = None;
 
     for entry in walkdir::WalkDir::new(&work_dir) {
         let entry = entry?;
         let path = entry.path();
 
-        if path.ends_with("isolinux.bin") {
-            isolinux_path = Some(path.to_path_buf());
-        } else if path.ends_with("efi.img") {
-            grub_efi_path = Some(path.to_path_buf());
+        // Preferência 1 — bootx64.efi
+        if path.file_name().map(|f| f == "bootx64.efi").unwrap_or(false) && path.is_file() {
+            efi_boot = Some(path.strip_prefix(&work_dir).unwrap().to_path_buf());
+            break;
         }
     }
 
-    if isolinux_path.is_none() && grub_efi_path.is_none() {
-        eprintln!("❌ Nenhum arquivo de boot encontrado (isolinux ou grub)");
-        let _ = Command::new("umount").arg(&mount_dir).status();
-        return Ok(());
+    // Procurar qualquer .efi se não achou bootx64.efi
+    if efi_boot.is_none() {
+        for entry in walkdir::WalkDir::new(&work_dir) {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "efi").unwrap_or(false) && path.is_file() {
+                efi_boot = Some(path.strip_prefix(&work_dir).unwrap().to_path_buf());
+                break;
+            }
+        }
     }
 
-    println!(
-        "[iso_injector] Detectado boot loader: isolinux: {:?}, grub EFI: {:?}",
-        isolinux_path, grub_efi_path
-    );
+    println!("[iso_injector] UEFI detectado: {:?}", efi_boot);
 
-    // === Injeta o arquivo ===
-    let dest_path = work_dir.join(inject_dest.strip_prefix("/").unwrap());
-    fs::create_dir_all(&dest_path)?;
-    fs::copy(&inject_file, dest_path.join(inject_file.file_name().unwrap()))?;
-    println!("> Arquivo injetado em {}", dest_path.display());
+    // === Injeta arquivo ===
+    let relative_dest = inject_dest.strip_prefix("/").unwrap();
+    let dest_dir = work_dir.join(relative_dest);
+    fs::create_dir_all(&dest_dir)?;
+    let final_file_path = dest_dir.join(inject_file.file_name().unwrap());
+    fs::copy(&inject_file, &final_file_path)?;
+    println!("> Arquivo injetado em {}", final_file_path.display());
 
-    // === Gera nova ISO ===
-    println!("> xorriso -as mkisofs -o {} -J -r {}", output_iso.display(), work_dir.display());
+    // === Monta argumentos do xorriso ===
+    let mut args = vec![
+        "-as", "mkisofs",
+        "-o", output_iso.to_str().unwrap(),
+        "-J",
+        "-r",
+        "-V", "LINUX_MINT_CUSTOM",
+        "-c", "boot.cat",
+        "-b", "isolinux/isolinux.bin",
+        "-no-emul-boot",
+        "-boot-load-size", "4",
+        "-boot-info-table",
+    ];
+
+    println!("> xorriso {:?}", args);
+
+    args.push(work_dir.to_str().unwrap());
 
     let status = Command::new("xorriso")
-        .args([
-            "-as", "mkisofs",
-            "-o", output_iso.to_str().unwrap(),
-            "-J",
-            "-r",
-            "-V", "LINUX_MINT_CUSTOM",
-            "-isohybrid-mbr", "/usr/lib/syslinux/bios/isohdpfx.bin",
-            "-c", "boot.cat",
-            "-b", "isolinux/isolinux.bin",
-            "-no-emul-boot",
-            "-boot-load-size", "4",
-            "-boot-info-table",
-            "-eltorito-alt-boot",
-            "-e", "boot/grub/efi.img",
-            "-no-emul-boot",
-            work_dir.to_str().unwrap(),
-        ])
+        .args(&args)
         .status()?;
-
     if !status.success() {
-        eprintln!("❌ Falha ao gerar nova ISO");
+        eprintln!("❌ Erro ao gerar nova ISO");
         std::process::exit(1);
     }
 
     // === Desmonta ISO ===
-    println!("> umount {}", mount_dir.display());
     let _ = Command::new("umount").arg(&mount_dir).status();
+    println!("> umount {}", mount_dir.display());
 
     println!("✅ ISO modificada criada com sucesso!");
     println!("📦 Arquivo final: {}", output_iso.display());
